@@ -1,0 +1,786 @@
+// ===================================================================
+// @last-modified 2016-06-01
+// This is free and unencumbered software released into the public domain.
+// ===================================================================
+
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+
+#include <algorithm>
+#include <mutex>
+#include <thread>
+#include <vector>
+
+#include "kiasu.h"
+
+// ---------------------------------------------------------------------
+// Static Vars and Typedefs
+// ---------------------------------------------------------------------
+
+#ifdef DEBUG
+static const block BASE_KEY = { 
+    0x7d, 0x89, 0x55, 0x51, 0xa4, 0x5f, 0xa7, 0xce
+};
+#endif
+static const block BASE_PLAINTEXT = { 
+    0x0b, 0xfc, 0x8f, 0x5a, 0x35, 0xe7, 0x8f, 0x2d
+};
+static const block BASE_TWEAK = { 
+    0x3a, 0x00, 0x4a, 0x00, 0xf1, 0x00, 0xd8, 0x00 
+};
+// The delta difference at the end of our boomerang trails.
+static const uint64_t MASKS[KIASU_ROUNDS+1] = {
+    0L,                  // 0
+    0L,                  // 1
+    0L,                  // 2
+    0L,                  // 3
+    0x0000FFFFFFFFFFFFL, // 4
+    0x0FFFFFFFFFFFFFFFL, // 5
+    0x0FFFFFFFFFFFFFFFL, // 6
+    0x0FFFF0FFFF0FFFF0L  // 7
+};
+static const uint8_t TWEAK_SHIFT = 0xa0;
+static const uint8_t NUM_QUARTETS = 16;
+static const uint8_t MAX_NUM_THREADS = 4;
+static const uint32_t NUM_THRESHOLD_QUARTETS = 40000;
+static const uint32_t NUM_KLAST_CANDIDATES = 
+#ifdef DEBUG
+    16;
+#else
+    1 << 16;
+#endif
+static block DELTA;
+
+typedef struct {
+    block p;
+    block q;
+    uint64_t q64;
+    block t;
+    block c;
+    block d;
+} pair;
+
+// ---------------------------------------------------------------------
+
+typedef struct {
+    block p;
+    block p_;
+    block q;
+    block q_;
+    block t;
+    block t_;
+    block c;
+    block c_;
+    block d;
+    block d_;
+} quartet;
+
+// ---------------------------------------------------------------------
+
+static void print_hex(const char label[], 
+                      const uint8_t* x, 
+                      const size_t n) {
+    printf("%s ", label);
+
+    for (size_t i = 0; i < n; ++i) {
+        printf("%02x", x[i]);
+    }
+
+    puts("");
+}
+
+// ---------------------------------------------------------------------
+
+static void print_block(const char label[], const uint8_t* x) {
+    print_hex(label, x, KIASU_BLOCKLEN);
+}
+
+// ---------------------------------------------------------------------
+
+static void xor_block(block out, 
+                      const block a, 
+                      const block b) {
+    for (uint32_t i = 0; i < KIASU_BLOCKLEN; ++i) {
+        out[i] = a[i] ^ b[i];
+    }
+}
+
+// ---------------------------------------------------------------------
+
+#ifndef DEBUG
+static void get_random(void* buffer, size_t num_bytes) {
+    FILE* fp;
+    fp = fopen("/dev/urandom", "r");
+    fread(buffer, 1, num_bytes, fp);
+    fclose(fp);
+}
+#endif
+
+// ---------------------------------------------------------------------
+
+static inline void to_block(block x, const uint64_t y) {
+    x[0] = (y >> 56) & 0xFF;
+    x[1] = (y >> 48) & 0xFF;
+    x[2] = (y >> 40) & 0xFF;
+    x[3] = (y >> 32) & 0xFF;
+    x[4] = (y >> 24) & 0xFF;
+    x[5] = (y >> 16) & 0xFF;
+    x[6] = (y >>  8) & 0xFF;
+    x[7] =  y & 0xFF;
+}
+
+// ---------------------------------------------------------------------
+
+static inline uint64_t to_uint64(const uint8_t* x) {
+    return ((uint64_t)x[0] << 56) 
+         | ((uint64_t)x[1] << 48)
+         | ((uint64_t)x[2] << 40)
+         | ((uint64_t)x[3] << 32)
+         | ((uint64_t)x[4] << 24)
+         | ((uint64_t)x[5] << 16)
+         | ((uint64_t)x[6] <<  8)
+         |  (uint64_t)x[7];
+}
+
+// ---------------------------------------------------------------------
+
+static inline int compare_plaintexts(const pair& lhs, 
+                                     const pair& rhs) {
+    // Return -1 if B < A
+    // Return  0 if B = A
+    // Return +1 if B > A
+    // Compares texts for the 48 bits that are NOT on the main diagonal.
+    // It actually does not matter how we sort since our interest limits to 
+    // the identification of pairs which are equal in all 48 bits NOT on the
+    // main diagonal for finding quartets.
+    return lhs.q64 < rhs.q64;
+}
+
+// ---------------------------------------------------------------------
+
+static inline int are_equal(const pair& pair1, 
+                            const pair& pair2) {
+    return pair1.q64 == pair2.q64;
+}
+
+// ---------------------------------------------------------------------
+
+static void create_plaintext(block p, 
+                             const uint32_t i) {
+    p[0] = ((i >> 8) & 0xF0) | (p[0] & 0x0F);
+    p[2] = ((i >> 8) & 0x0F) | (p[2] & 0xF0);
+    p[5] = (i & 0xF0) | (p[5] & 0x0F);
+    p[7] = (i & 0x0F) | (p[7] & 0xF0);
+}
+
+// ---------------------------------------------------------------------
+
+static void create_klast(block klast, const uint32_t i) {
+#ifdef DEBUG
+    klast[0] = ((i << 4) & 0xF0) | (klast[0] & 0x0F);
+#else
+    memset(klast, 0x00, KIASU_BLOCKLEN);
+    klast[0] = ((i >> 8) & 0xF0) | (klast[0] & 0x0F);
+    klast[3] = ((i >> 8) & 0x0F) | (klast[3] & 0xF0);
+    klast[5] = (i        & 0xF0) | (klast[5] & 0x0F);
+    klast[6] = (i        & 0x0F) | (klast[6] & 0xF0);
+#endif
+}
+
+// ---------------------------------------------------------------------
+
+static void create_pair(pair* target, 
+                        const block p, 
+                        const block c, 
+                        const block q, 
+                        const block d, 
+                        const block t, 
+                        const uint64_t mask) {
+    memcpy(target->p, p, KIASU_BLOCKLEN);
+    memcpy(target->c, c, KIASU_BLOCKLEN);
+    memcpy(target->q, q, KIASU_BLOCKLEN);
+    memcpy(target->d, d, KIASU_BLOCKLEN);
+    memcpy(target->t, t, KIASU_BLOCKLEN);
+    target->q64 = to_uint64(q) & mask;
+}
+
+// ---------------------------------------------------------------------
+
+static void create_quartet(quartet* target, 
+                           const pair& pair1, 
+                           const pair& pair2) {
+    memcpy(target->p, pair1.p, KIASU_BLOCKLEN);
+    memcpy(target->c, pair1.c, KIASU_BLOCKLEN);
+    memcpy(target->q, pair1.q, KIASU_BLOCKLEN);
+    memcpy(target->d, pair1.d, KIASU_BLOCKLEN);
+    memcpy(target->t, pair1.t, KIASU_BLOCKLEN);
+
+    memcpy(target->p_, pair2.p, KIASU_BLOCKLEN);
+    memcpy(target->c_, pair2.c, KIASU_BLOCKLEN);
+    memcpy(target->q_, pair2.q, KIASU_BLOCKLEN);
+    memcpy(target->d_, pair2.d, KIASU_BLOCKLEN);
+    memcpy(target->t_, pair2.t, KIASU_BLOCKLEN);
+}
+
+// ---------------------------------------------------------------------
+
+static void find_num_quartets(std::vector<pair>& pairs, 
+                              uint32_t* num_quartets, 
+                              quartet* quartets) {
+    uint32_t num_equal = 0;
+    std::vector<pair>::const_iterator current = pairs.begin();
+    std::vector<pair>::const_iterator previous = pairs.begin();
+    current++;
+
+    for ( ; current != pairs.end(); current++) {
+        if (are_equal(*current, *previous)) {
+            if (num_equal + *num_quartets < NUM_QUARTETS) {
+                quartet quart;
+                create_quartet(&quart, *current, *previous);
+                quartets[num_equal + *num_quartets] = quart;
+            }
+
+            num_equal++;
+        } else if (num_equal > 0) {
+            *num_quartets += ((num_equal + 1) * num_equal) / 2;
+            num_equal = 0;
+        }
+
+        previous = current;
+    }
+
+    if (num_equal > 0) {
+        *num_quartets += ((num_equal + 1) * num_equal) / 2;
+        num_equal = 0;
+    }
+}
+
+// ---------------------------------------------------------------------
+
+static void find_quartets(std::vector<pair>& pairs, 
+                          uint32_t* num_quartets, 
+                          quartet* quartets) {
+    std::sort(pairs.begin(), pairs.end(), compare_plaintexts);
+    find_num_quartets(pairs, num_quartets, quartets);
+}
+
+// ---------------------------------------------------------------------
+
+static void find_key_byte(const size_t index, 
+                          const int is_msb_nibble, 
+                          const block delta_x, 
+                          const block delta_y, 
+                          const size_t key_index,
+                          const block p,
+                          const block t,
+                          uint8_t key_candidates[4][KIASU_SBOXLEN]) {
+    uint8_t keys[KIASU_SBOXLEN];
+    uint8_t key_candidate;
+
+    const uint8_t dx = (delta_x[index] >> (is_msb_nibble ? 4 : 0)) & 0xF;
+    const uint8_t dy = (delta_y[index] >> (is_msb_nibble ? 4 : 0)) & 0xF;
+
+    get_sbox_trails(keys, dx, dy);
+
+    for (size_t i = 0; i < KIASU_SBOXLEN; ++i) {
+        if (keys[i] != 0) {
+            key_candidate = ((p[index] ^ t[index]) 
+                >> (is_msb_nibble ? 4 : 0));
+            key_candidate = (key_candidate ^ i) & 0xF;
+            key_candidates[key_index][key_candidate]++;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
+
+static void find_keys_for_quartet(const quartet* quart, 
+                                  uint8_t key_candidates[4][KIASU_SBOXLEN]) {
+    // ---------------------------------------------------------------------
+    // Given a quartet (P, P', Q, Q') and their tweaks (T_P, T_{P'}, T_Q,
+    // T_{Q'}), we assume that the pairs (P, T_P) and (P', T_{P'}) collide 
+    // after the first round: Round(P, T) = Round(P', T').
+    // 
+    // Similarly, we assume that the pairs (Q, T_Q) and (Q', T_{Q'}) collide 
+    // after the first round: Round(Q, T) = Round(Q', T').
+    // 
+    // We compute the difference before (Delta X) and after (Delta Y) SubBytes:
+    // AddKey -> AddTweak := Delta X = X xor X' 
+    //                               = (P xor P') xor (T_P xor T_{P'})
+    // Y xor Y' = Delta Y <- ShiftRows^{-1} <- MixColumns^{-1} <- AddTweak^{-1}
+    // 
+    // Next, we show which possible values X, X' can be mapped to Y, Y' 
+    // We derive the keys that map P -> X and P' -> X'
+    // We repeat this procedure for Q -> X and Q' -> X'
+    // 
+    // For each possible value of a key byte, we increment a counter
+    // Finally, we output the key-byte counters
+    // ---------------------------------------------------------------------
+    
+    block tmp;
+    block delta_x;
+    xor_block(delta_x, quart->p, quart->p_);
+
+    block delta_y;
+    xor_block(delta_y, quart->t, quart->t_);
+    xor_block(delta_x, delta_x, delta_y);
+    
+    invert_mixcolumns(tmp, delta_y);
+    invert_shiftrows(delta_y, tmp);
+
+    find_key_byte(0, 1, delta_x, delta_y, 0, quart->p, quart->t, key_candidates); 
+    find_key_byte(2, 0, delta_x, delta_y, 1, quart->p, quart->t, key_candidates); 
+    find_key_byte(5, 1, delta_x, delta_y, 2, quart->p, quart->t, key_candidates); 
+    find_key_byte(7, 0, delta_x, delta_y, 3, quart->p, quart->t, key_candidates); 
+
+    // ---------------------------------------------------------------------
+    // We repeat this for Q -> X and Q' -> X'
+    // Note: We construct pairs so that T_Q = T_P xor TWEAK_SHIFT. 
+    // Hence, it also holds that T_{Q'} = T_{P'} xor TWEAK_SHIFT. 
+    // It follows that T_Q xor T_{Q'} = T_P xor T_{P'}.
+    // ---------------------------------------------------------------------
+
+    xor_block(delta_x, quart->q, quart->q_);
+    xor_block(delta_y, quart->t, quart->t_);
+    xor_block(delta_x, delta_x, delta_y);
+    
+    invert_mixcolumns(tmp, delta_y);
+    invert_shiftrows(delta_y, tmp);
+
+    block t_q;
+    memcpy(t_q, quart->t, KIASU_BLOCKLEN);
+    t_q[0] ^= TWEAK_SHIFT;
+
+    find_key_byte(0, 1, delta_x, delta_y, 0, quart->q, t_q, key_candidates); 
+    find_key_byte(2, 0, delta_x, delta_y, 1, quart->q, t_q, key_candidates); 
+    find_key_byte(5, 1, delta_x, delta_y, 2, quart->q, t_q, key_candidates); 
+    find_key_byte(7, 0, delta_x, delta_y, 3, quart->q, t_q, key_candidates); 
+}
+
+// ---------------------------------------------------------------------
+
+static uint8_t find_max(const uint8_t* array, const size_t n) {
+    uint8_t max = 0;
+    size_t index = 0;
+
+    for (size_t i = 0; i < n; ++i) {
+        if (max < array[i]) {
+            max = array[i];
+            index = i;
+        }
+    }
+
+    return index;
+}
+
+// ---------------------------------------------------------------------
+
+static void find_keys(const quartet* quartets, 
+                      const uint32_t num_quartets, 
+                      block recovered_key) {
+    uint8_t key_candidates[4][KIASU_SBOXLEN];
+
+    for (uint32_t i = 0; i < 4; ++i) {
+        for (uint32_t j = 0; j < KIASU_SBOXLEN; ++j) {
+            key_candidates[i][j] = 0;
+        }
+    }
+
+    for (uint32_t i = 0; i < num_quartets; ++i) {
+        find_keys_for_quartet(&(quartets[i]), key_candidates);
+    }
+
+    uint8_t max[4];
+
+    for (int i = 0; i < 4; ++i) {
+        max[i] = find_max(&(key_candidates[i][0]), KIASU_SBOXLEN);
+    }
+
+    memset(recovered_key, 0, KIASU_KEYLEN);
+    recovered_key[0] = (max[0] << 4) & 0xF0;
+    recovered_key[2] =  max[1]       & 0x0F;
+    recovered_key[5] = (max[2] << 4) & 0xF0;
+    recovered_key[7] =  max[3]       & 0x0F;
+
+    for (uint32_t i = 0; i < 4; ++i) {
+        printf("Key nibble %2d \n", i);
+
+        for (uint32_t j = 0; j < KIASU_SBOXLEN; ++j) {
+            printf("%4d", j);
+        }
+
+        puts("");
+
+        for (uint32_t j = 0; j < KIASU_SBOXLEN; ++j) {
+            printf("%4d", key_candidates[i][j]);
+        }
+
+        puts("");
+    }
+}
+
+// ---------------------------------------------------------------------
+
+static void get_key(block key) {
+#ifdef DEBUG
+    memcpy(key, BASE_KEY, KIASU_KEYLEN);
+#else
+    // Initialize Kiasu-BC with a random key.
+    get_random(key, KIASU_KEYLEN);
+#endif
+}
+
+// ---------------------------------------------------------------------
+
+static void derive_d(const block klast, 
+                     block d, 
+                     const block c, 
+                     const block t, 
+                     const block shifted_tweak, 
+                     const block DELTA) {
+    // ---------------------------------------------------------------
+    // Note: DELTA contains already 
+    // MC(tweak_shift) xor (tweak xor shifted_tweak).
+    // Thus, we do NOT xor the tweak-difference (tweak xor shifted_tweak)
+    // from Round 6 to the state one round backwards.
+    // ---------------------------------------------------------------
+
+    kiasu_decrypt_final_round(d, c, t, klast);
+    xor_block(d, d, DELTA);
+    kiasu_encrypt_final_round(d, d, shifted_tweak, klast);
+    
+    const uint64_t c_ = to_uint64(c) & 0x0FFFFFF0FF0FF0FFL;
+    const uint64_t d_ = to_uint64(d) & 0xF000000F00F00F00L;
+    to_block(d, c_ | d_);
+}
+
+// ---------------------------------------------------------------------
+
+static void precompute_ciphertexts(const kiasu_ctx* ctx, 
+                                   block* ciphertexts,
+                                   block p, 
+                                   const uint32_t num_texts_per_set, 
+                                   const uint32_t num_sets) {
+    block t;
+    block c;
+    memcpy(t, BASE_TWEAK, KIASU_BLOCKLEN);
+
+    for (uint32_t i = 0; i < num_texts_per_set; ++i) {
+        // ---------------------------------------------------------------
+        // For each plaintext, encode the counter i into Nibbles 0,5,10,15.
+        // ---------------------------------------------------------------
+        
+        create_plaintext(p, i);
+
+        for (uint32_t j = 0; j < num_sets; ++j) { // For each tweak
+            t[0] = ((j << 4) & 0xF0) | (t[0] & 0x0F);
+            kiasu_encrypt(ctx, c, p, t, KIASU_ROUNDS);
+            memcpy(&(ciphertexts[num_sets * i + j]), c, KIASU_BLOCKLEN);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
+
+static void perform_experiment(const kiasu_ctx* ctx, 
+                               const uint32_t klast_index, 
+                               const block* plaintexts, 
+                               const block* ciphertexts, 
+                               const uint32_t num_sets, 
+                               const uint32_t num_texts_per_set, 
+                               const uint32_t num_structures,
+                               const uint8_t num_rounds, 
+                               uint32_t* num_quartets, 
+                               quartet* quartets) {
+    block klast;
+#ifdef DEBUG
+    memcpy(klast, ctx->key[KIASU_ROUNDS], KIASU_BLOCKLEN);
+#endif
+    create_klast(klast, klast_index);
+
+    block t;
+    block shifted_tweak;
+    memcpy(t, BASE_TWEAK, KIASU_BLOCKLEN);
+    memcpy(shifted_tweak, BASE_TWEAK, KIASU_BLOCKLEN);
+
+    std::vector<pair> pairs;
+    const uint64_t mask = MASKS[num_rounds];
+
+    // ---------------------------------------------------------------
+    // Build texts
+    // ---------------------------------------------------------------
+
+    for (uint32_t k = 0; k < num_structures; ++k) {
+        // ---------------------------------------------------------------
+        // Setup base plaintext: random for each structure
+        // ---------------------------------------------------------------
+
+        block p;
+        block q;
+        size_t c;
+        block d;
+
+        memcpy(p, &(plaintexts[k]), sizeof(block));
+
+        for (uint32_t i = 0; i < num_texts_per_set; ++i) { 
+            // ---------------------------------------------------------------
+            // For each plaintext, encode the counter into Nibbles 0,5,10,15.
+            // ---------------------------------------------------------------
+
+            create_plaintext(p, i);
+
+            for (uint32_t j = 0; j < num_sets; ++j) { // For each tweak
+                t[0] = ((j << 4) & 0xF0) | (t[0] & 0x0F);
+                shifted_tweak[0] = t[0] ^ TWEAK_SHIFT;
+
+                c = num_sets * i + j;
+                derive_d(klast, d, ciphertexts[c], t, shifted_tweak, DELTA);
+                kiasu_decrypt(ctx, q, d, shifted_tweak, num_rounds);
+
+                pair target;
+                create_pair(&target, p, ciphertexts[c], q, d, t, mask);
+
+                pairs.push_back(target);
+
+#ifdef DEBUG
+                // print_block("p ", p);
+                // print_block("q ", q);
+                // block x;
+                // to_block(x, target.q64);
+                // print_block("q_", x);
+                // print_block("c ", ciphertexts[c]);
+                // print_block("d ", d);
+                // print_block("t ", t);
+                // print_block("t'", shifted_tweak);
+                // puts("------------------");
+#endif  
+            }
+        }
+
+        // ---------------------------------------------------------------
+        // Correct quartets must be in the same structure. 
+        // For num_rounds < KIASU_ROUNDS, we could also perform quartet 
+        // search for each plaintext separately (since for those, we start 
+        // from the end of Round 1 where P = P'). 
+        // For num_rounds = KIASU_ROUNDS, we start from begin of Round 1.
+        // ---------------------------------------------------------------
+
+        find_quartets(pairs, num_quartets, quartets);
+    }
+}
+
+// ---------------------------------------------------------------------
+
+static void perform_experiments(const size_t thread_index,
+                                std::mutex& mutex,
+                                const uint32_t num_keys, 
+                                const uint32_t num_texts_per_set, 
+                                const uint32_t num_sets, 
+                                const uint32_t num_structures,
+                                const uint8_t num_rounds) {
+    block key;
+
+    for (uint32_t i = 0; i < num_keys; ++i) {
+        mutex.lock();
+        get_key(key);
+        mutex.unlock();
+
+        // -----------------------------------------------------------------
+        // We must predetermine the random base plaintexts here; if we did it
+        // in the experiment, we would use different texts for each candidate
+        // of the last round key.
+        // -----------------------------------------------------------------
+        
+        block* plaintexts = (block*)malloc(num_structures * sizeof(block));
+
+        mutex.lock();
+#ifdef DEBUG
+        // -----------------------------------------------------------------
+        // Always choose the same plaintexts as base when debugging
+        // -----------------------------------------------------------------
+
+        for (size_t ns = 0; ns < num_structures; ++ns) {
+            memcpy(plaintexts + ns * KIASU_BLOCKLEN, 
+                BASE_PLAINTEXT, KIASU_BLOCKLEN);
+        }
+#else
+        get_random(plaintexts, num_structures * sizeof(block));
+#endif
+
+        puts("------------------");
+        print_block("Base K ", key);
+        print_block("Base T ", BASE_TWEAK);
+        print_block("DELTA  ", DELTA);
+        print_block("Base P ", BASE_PLAINTEXT);
+        mutex.unlock();
+
+        // -----------------------------------------------------------------
+        // Run key setup (once per key)
+        // -----------------------------------------------------------------
+
+        kiasu_ctx ctx;
+        kiasu_key_setup(&ctx, key);
+
+        // -----------------------------------------------------------------
+        // Encrypt plaintexts and store ciphertexts (once per key)
+        // -----------------------------------------------------------------
+
+        const uint32_t num_ciphertexts = num_sets * num_texts_per_set;
+        block* ciphertexts = (block*)malloc(num_ciphertexts * KIASU_BLOCKLEN);
+
+        precompute_ciphertexts(
+            &ctx, ciphertexts, plaintexts[0], num_texts_per_set, num_sets
+        );
+
+        // -----------------------------------------------------------------
+        // Run key setup only once per key
+        // -----------------------------------------------------------------
+
+        for (uint32_t klast = 0; klast < NUM_KLAST_CANDIDATES; ++klast) {
+            uint32_t num_quartets = 0;
+            quartet quartets[NUM_QUARTETS];
+
+            perform_experiment(
+                &ctx, 
+                klast, 
+                plaintexts, 
+                ciphertexts,
+                num_sets, 
+                num_texts_per_set, 
+                num_structures, 
+                num_rounds, 
+                &num_quartets, 
+                quartets
+            );
+
+            mutex.lock();
+            printf("Thread %zu, klast: %u, #Quartets: %u\n", 
+                thread_index, klast, num_quartets);
+            mutex.unlock();
+
+            // -----------------------------------------------------------------
+            // Append key recovery for full #rounds
+            // -----------------------------------------------------------------
+
+            if (num_quartets < NUM_THRESHOLD_QUARTETS) {
+                continue;
+            }
+
+            if (num_quartets > NUM_QUARTETS) {
+                num_quartets = NUM_QUARTETS;
+            }
+            
+            mutex.lock();
+            if ((num_rounds == KIASU_ROUNDS) && (num_quartets > 0)) {
+                block recovered_key;
+#ifdef DEBUG
+                for (size_t i = 0; i < num_quartets; ++i) {
+                    quartet* quart = &(quartets[i]);
+                    print_block("P :", quart->p);
+                    print_block("Q :", quart->q);
+                    print_block("C :", quart->c);
+                    print_block("D :", quart->d);
+                    print_block("P':", quart->p_);
+                    print_block("Q':", quart->q_);
+                    print_block("C':", quart->c_);
+                    print_block("D':", quart->d_);
+                    puts("------------------");
+                }
+#endif
+
+                find_keys(quartets, num_quartets, recovered_key);
+
+                print_block("Found   K0", recovered_key);
+                print_block("Correct K0", key);
+
+                block recovered_klast;
+                memset(recovered_klast, 0x00, KIASU_BLOCKLEN);
+                create_klast(recovered_klast, klast);
+
+                kiasu_ctx ctx;
+                kiasu_key_setup(&ctx, key);
+                print_block("Found   K7", recovered_klast);
+                print_block("Correct K7", ctx.key[KIASU_ROUNDS]);
+            }
+            mutex.unlock();
+        }
+
+        free(plaintexts);
+        free(ciphertexts);
+    }
+}
+
+// ---------------------------------------------------------------------
+// User interface, main, and options.
+// ---------------------------------------------------------------------
+
+static void print_usage(const char* name) {
+    puts("Tests the 7-round boomerang attack on Kiasu-BC "\
+         "with 64-bit Mini-Kiasu-BC. Mini-Kiasu-BC uses the AES-128 "\
+         "key schedule on nibbles, the Piccolo S-box and the AES MDS matrix "\
+         "with x^4 + x + 1 as irreducible polynomial.");
+    printf("Usage: %s <#keys> <#texts per set> <#sets>\n", name);
+    puts(" [<#structures>");
+    puts("- <#keys>: #Random keys to test. E.g. 1 or 20");
+    puts("- <#texts per set>: #Texts per set. E.g. 2^{16}");
+    puts("- <#sets>: #Sets. Should be <= 2^4");
+    puts("- <#rounds>: #Rounds. Should be 4..7, default: 7");
+    puts("- <#structures>: #Structures. Default: 1");
+}
+
+// ---------------------------------------------------------------------
+
+int main(int argc, char** argv) {
+    if (argc < 4) {
+        print_usage(argv[0]);
+        exit(1);
+    }
+
+    prepare_delta(DELTA, TWEAK_SHIFT);
+
+    // ---------------------------------------------------------------------
+    // Interface
+    // ---------------------------------------------------------------------
+
+    const uint32_t num_keys = atoi(argv[1]);
+    const uint32_t num_texts_per_set = atoi(argv[2]);
+    const uint32_t num_sets = atoi(argv[3]);
+    uint32_t num_structures = 1;
+    uint8_t num_rounds = KIASU_ROUNDS;
+
+    if (argc >= 5) {
+        num_rounds = atoi(argv[4]);
+    }
+
+    if (argc >= 6) {
+        num_structures = atoi(argv[5]);
+    }
+
+    std::mutex mutex;
+    std::vector<std::thread> threads;
+    const size_t num_threads = num_keys > MAX_NUM_THREADS ? 
+        MAX_NUM_THREADS : 
+        num_keys;
+
+    threads.reserve(num_threads);
+
+    for (size_t i = 0; i < num_threads; ++i) {
+        threads.emplace_back(perform_experiments, 
+            i, 
+            std::ref(mutex), 
+            num_keys / num_threads, 
+            num_texts_per_set, 
+            num_sets, 
+            num_structures,
+            num_rounds
+        );
+    }
+
+    for (auto& t : threads) {
+        t.join();
+    }
+    
+    return 0;
+}
