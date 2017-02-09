@@ -1,7 +1,6 @@
-======================================================================
-Code for validating boomerang probabilities on Kiasu-BC
-======================================================================
-# Description
+# Code for validating boomerang probabilities on Kiasu-BC
+
+## Description
 Contains three implementations for validating the 6- and 7-round boomerang
 distinguishers on Kiasu-BC and a downscaled version Mini-Kiasu-BC and 
 round-reduced versions thereof.
@@ -10,7 +9,7 @@ Original publication:
 
 https://eprint.iacr.org/2016/1170
 
-# Working Manner
+## Working Manner
 Since the 7-round distinguisher is infeasible to test with Kiasu-BC (and slow
 for the 6-round distinguisher), we defined Mini-Kiasu-BC is as a 
 nibblewise-operating variant of Kiasu-BC that employs the same high-level
@@ -34,7 +33,7 @@ possible values of the first tweak byte,
 
 The base plaintexts of each structure and the keys is chosen from /dev/urandom.
 
-# Building
+## Building
 Simply run the make file in the individual subdirectories. There are several 
 targets, among the important ones are:
 
@@ -47,6 +46,6 @@ targets, among the important ones are:
 - `make clean`
   Cleans executables
 
-# Dependencies
+## Dependencies
 - clang
 - make
